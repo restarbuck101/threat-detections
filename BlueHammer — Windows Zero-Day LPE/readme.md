@@ -18,7 +18,7 @@
 
 This folder covers the **blue team response for Microsoft Sentinel and Azure-connected environments** — threat hunting with KQL, production-validated detection rules, FP baselines, and deployment guidance for Sentinel + Defender for Endpoint.
 
-**[technoherder/BlueHammerFix](https://github.com/technoherder/BlueHammerFix)** is essential reading alongside this content. Their repo covers the red team and static analysis side of BlueHammer in depth — if you want to understand how the exploit actually works before you defend against it, start there:
+**[technoherder/BlueHammerFix](https://github.com/technoherder/BlueHammerFix)** is essential reading alongside this content. Their repo covers the red team and static analysis side of BlueHammer in depth — if you want to understand how the exploit actually works before you defend against it and sigma rules, start there:
 
 - Full static analysis of the exploit chain (7 stages, ~3,450 lines of source)
 - 9 bug fixes to the original PoC including a `--force` flag for lab testing
