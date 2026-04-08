@@ -276,9 +276,6 @@ testing:
     evidence_path: "docs/test-evidence/win_security_bluehammer_kill_chain_correlation/simulation-log.md"
     notes:         "Run at least two BlueHammer emulation modules sequentially on test host within 30 minutes. Confirm: (1) individual rules fire, (2) composite rule fires, (3) HostName field populates correctly. Adjust Entities JSON extraction if HostName is empty."
 
-# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
-design_document_path: "docs/design/win_security_bluehammer_kill_chain_correlation-design.md"
-
 # ── CHANGE HISTORY ────────────────────────────────────────────────────────────
 change_history:
   - date:      "2026-04-08"
