@@ -1,0 +1,215 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_vss_shadow_copy_enumeration_user_space"
+title: "Volume Shadow Copy Enumeration from User-Space Process"
+description: |
+  Detects user-space processes enumerating Volume Shadow Copy snapshots via
+  vssadmin, wmic, or PowerShell Win32_ShadowCopy calls from a non-system,
+  non-machine account.
+
+  BlueHammer runs a continuous worker thread enumerating
+  \Device\HarddiskVolumeShadowCopy* waiting for the snapshot created by Defender
+  during its update workflow. More broadly, VSS enumeration from interactive user
+  sessions is a reconnaissance step common to:
+    - Ransomware (pre-deletion of shadow copies — T1490)
+    - Credential theft tools targeting VSS-accessible registry hives (T1003.002)
+    - BlueHammer-style LPE exploits (T1068)
+
+  Legitimate VSS enumeration is performed by backup agents and system processes
+  running under SYSTEM or service accounts, which are filtered by this detection.
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "High"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0004"    # Privilege Escalation
+    - "TA0007"    # Discovery
+    - "TA0040"    # Impact
+  techniques:
+    - "T1068"     # Exploitation for Privilege Escalation
+    - "T1490"     # Inhibit System Recovery
+    - "T1082"     # System Information Discovery
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "DeviceProcessEvents (MDE via XDR Connector — Microsoft Defender XDR data connector required in Sentinel)"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+# NOTE: wmic.exe and vssadmin.exe are intentionally not excluded despite being
+# admin tools. BlueHammer and ransomware tools commonly invoke VSS enumeration
+# through these binaries from user context. Review all hits manually before
+# adding exclusions.
+query: |
+  DeviceProcessEvents
+  | where TimeGenerated > ago(1h)
+  | where ProcessCommandLine has_any (
+      "HarddiskVolumeShadowCopy",
+      "Win32_ShadowCopy",
+      @"GLOBALROOT\Device\HarddiskVolumeShadow",
+      "vssadmin list shadows",
+      "vssadmin list shadowstorage"
+  )
+  | where AccountSid != "S-1-5-18"
+  | where AccountName !endswith "$"
+  | where isnotempty(AccountName)
+  | where FileName !in~ (
+      "wbengine.exe",
+      "vssvc.exe"
+  )
+  | project
+      TimeGenerated,
+      DeviceName,
+      AccountName,
+      AccountDomain,
+      FileName,
+      FolderPath,
+      ProcessCommandLine,
+      InitiatingProcessFileName,
+      InitiatingProcessFolderPath,
+      InitiatingProcessCommandLine
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT5M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  false
+suppression_duration: "PT1H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT1H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "AccountName"
+      - identifier: "NTDomain"
+        column:     "AccountDomain"
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "DeviceName"
+  - entity_type: "Process"
+    field_mappings:
+      - identifier: "ProcessId"
+        column:     "FileName"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Process":         "FileName"
+  "Command Line":    "ProcessCommandLine"
+  "Parent Process":  "InitiatingProcessFileName"
+  "Parent Cmd Line": "InitiatingProcessCommandLine"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "AlertPerResult"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  Back-test returned zero results over 7 days in our environment. Expected FP
+  rate is low for interactive user account hits.
+
+  Common FP scenarios:
+  - IT administrators running vssadmin manually for storage management or
+    troubleshooting — verify against open change tickets or admin activity logs.
+    If recurring, consider a watchlist of approved IT admin accounts with VSS
+    management permissions.
+  - Backup software agents running under a named service account rather than
+    SYSTEM — these are not caught by the AccountSid filter. If identified,
+    add the specific service account to a watchlist exclusion.
+  - Vulnerability scanners or CSPM tools enumerating shadow copies as part of
+    a scheduled scan — verify against scan schedules.
+
+  Do not exclude powershell.exe or cmd.exe generically. BlueHammer and
+  ransomware tools invoke VSS enumeration through these binaries — excluding
+  them eliminates coverage for the most common attack paths.
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  1. Identify the account and process from alert entities.
+  2. Is AccountName an interactive user or a service account? Interactive user
+     accounts running vssadmin or wmic shadow copy queries are high suspicion.
+  3. Check the parent process chain — what spawned this process?
+     PowerShell spawned by an Office application or browser = strong malicious
+     indicator.
+  4. Check the same host in the 30-minute window for:
+     - cldapi.dll image load events (BlueHammer Cloud Files indicator)
+     - DeviceFileEvents with HarddiskVolumeShadowCopy in FolderPath
+     - SecurityEvent 4697 service install
+  5. If correlated indicators are present: isolate host via MDE and escalate
+     to Tier 2 / IR. May represent BlueHammer pre-exploitation or ransomware
+     shadow copy pre-deletion.
+  6. If AccountName is a known IT admin and the command aligns with documented
+     maintenance: verify against change ticket, document as FP, close.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1566.001"
+    description:  "Initial access establishes low-privileged foothold."
+    detection_id: "Covered by existing phishing and initial access detections"
+  following_technique:
+    mitre_id:     "T1068"
+    description:  "Attacker uses Cloud Files API to register sync root and freeze Defender via oplock once the pending VSS snapshot is identified."
+    detection_id: "win_security_cloud_files_sync_root_untrusted_process"
+  coverage_assessment: "Covers Step 1 of 8 in the BlueHammer chain. Also covers ransomware shadow copy pre-deletion (T1490)."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_vss_shadow_copy_enumeration_user_space/unit-test.md"
+    notes:         "Run from a standard user PowerShell session in isolated environment: vssadmin list shadows && wmic shadowcopy list brief. Confirm DeviceProcessEvents records and alert fires."
+  back_test:
+    status:        "PASS"
+    period_days:   7
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_vss_shadow_copy_enumeration_user_space/back-test.md"
+    notes:         "Back-test conducted April 8 2026. Zero results over 7 days of DeviceProcessEvents."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — custom module required"
+    atomic_test_ref:    "N/A"
+    evidence_path: "docs/test-evidence/win_security_vss_shadow_copy_enumeration_user_space/simulation-log.md"
+    notes:         "Run vssadmin list shadows from standard user context in isolated environment with MDE active. Confirm alert fires."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_vss_shadow_copy_enumeration_user_space-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. BlueHammer zero-day response. Back-test complete April 8 2026 — 7 days clean."

@@ -1,0 +1,214 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# ── CREDIT ───────────────────────────────────────────────────────────────────
+# Detection concept sourced from technoherder/BlueHammerFix
+# https://github.com/technoherder/BlueHammerFix
+# Original Sigma rule: bluehammer_temp_service_creation.yml
+# Author: Red Team (technoherder)
+#
+# This rule complements win_security_service_install_non_standard_path which
+# catches non-standard binary paths. This rule specifically catches GUID-named
+# transient services regardless of binary path — a more precise indicator of
+# the BlueHammer SYSTEM escalation step.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_guid_named_transient_service_creation"
+title: "GUID-Named Transient Service Created for SYSTEM Escalation"
+description: |
+  Detects creation of a Windows service with a GUID-formatted name
+  ({xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}). BlueHammer creates a temporary
+  GUID-named service running its own binary to escalate from local administrator
+  to NT AUTHORITY\SYSTEM, then immediately removes the service.
+
+  This detection is more specific than a general non-standard path rule — it
+  targets the naming pattern of the transient escalation service rather than
+  its binary location. GUID-named services created and deleted within seconds
+  have very limited legitimate use cases.
+
+  Technical context (from technoherder/BlueHammerFix analysis):
+  BlueHammer uses a medium-integrity admin token to call CreateService with a
+  GUID name, StartService to execute as SYSTEM, then DeleteService. The service
+  binary is the BlueHammer executable itself, called with a session ID argument
+  to spawn conhost.exe in the user's interactive session.
+
+  Credit: Detection concept from technoherder/BlueHammerFix (bluehammer_temp_service_creation.yml)
+  https://github.com/technoherder/BlueHammerFix
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering — KQL adaptation of technoherder/BlueHammerFix Sigma rule"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "High"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0004"    # Privilege Escalation
+    - "TA0002"    # Execution
+  techniques:
+    - "T1543.003" # Create or Modify System Process: Windows Service
+    - "T1569.002" # System Services: Service Execution
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "SecurityEvent — Windows Security Event Log (Event ID 4697)"
+  - "System Event Log (Event ID 7045) — requires System log forwarding to Sentinel"
+  - "Requires audit policy: Audit Security System Extension = Success"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+# NOTE: Event ID 4697 (Security log) and 7045 (System log) both capture service
+# installation. 4697 requires explicit audit policy; 7045 requires System log
+# forwarding. This query uses 4697. If your environment forwards System log,
+# add a union with Event table filtering on EventID 7045.
+#
+# NOTE: EventData key names vary by environment — validate with:
+#   SecurityEvent | where EventID == 4697 | project EventData | take 1
+query: |
+  SecurityEvent
+  | where TimeGenerated > ago(1h)
+  | where EventID == 4697
+  | extend ServiceName    = trim('"', tostring(parse_json(EventData).Service_Information_Service_Name))
+  | extend ServiceFileName = trim('"', tostring(parse_json(EventData).Service_Information_Service_File_Name))
+  | extend SubjectAccount  = tostring(parse_json(EventData).SubjectAccountName)
+  | where isnotempty(ServiceName)
+  // GUID service name pattern: {xxxxxxxx-xxxx-xxxx-xxxx-xxxxxxxxxxxx}
+  | where ServiceName matches regex @'^\{[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}\}$'
+  | project
+      TimeGenerated,
+      Computer,
+      SubjectAccount,
+      ServiceName,
+      ServiceFileName
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT5M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  false
+suppression_duration: "PT1H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT1H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "SubjectAccount"
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "Computer"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Service Name":    "ServiceName"
+  "Service Binary":  "ServiceFileName"
+  "Installing User": "SubjectAccount"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "AlertPerResult"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  GUID-named services are uncommon in legitimate enterprise software but not
+  unheard of. Known FP scenarios:
+
+  - Some software installers create GUID-named services temporarily during
+    installation — verify against active software deployments on the affected host.
+  - Container and sandbox technologies (Docker, Windows Sandbox) may create
+    GUID-named services for isolation purposes — verify against your container
+    infrastructure.
+  - Windows Update occasionally creates temporary services with GUID names
+    during patch application — correlate with Windows Update activity.
+  - Microsoft SCCM / Intune deployment agents may create GUID-named services
+    during software deployment — correlate with active deployments.
+
+  Key differentiator: BlueHammer's GUID service binary path points to the
+  exploit binary itself, typically in a user-writable location (Temp, AppData).
+  Check ServiceFileName — if it points to a standard Windows or enterprise
+  software path, treat as lower risk.
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  1. Check ServiceFileName from alert custom details.
+  2. Is the binary path in a user-writable location (Temp, AppData, user profile)?
+     If yes, escalate immediately — this is the BlueHammer escalation pattern.
+  3. Check the same host in the 30-minute window for:
+     - samlib.dll load by non-LSASS process
+     - LSA boot key registry access
+     - Event IDs 4723/4724 on local admin accounts
+     - VSS shadow copy access events
+  4. Check SubjectAccount — if this is an interactive standard user account
+     (not a service or admin account) creating a service, escalate immediately.
+  5. If service binary points to a known enterprise tool: verify against
+     active software deployments, document as FP if confirmed.
+  6. Correlate with Event ID 7040 (service start) and 7045 (service deleted)
+     for the same ServiceName to determine the service lifetime.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1134.001"
+    description:  "Local admin password reset and restored. SYSTEM token duplicated via token impersonation."
+    detection_id: "win_security_local_admin_password_rapid_change_restore"
+  following_technique:
+    mitre_id:     "T1003.001"
+    description:  "With SYSTEM access attacker may dump LSASS for domain credentials."
+    detection_id: "NONE — LSASS dump detection gap, flag for backlog"
+  coverage_assessment: "Covers Step 8 of 8 in the BlueHammer chain — GUID naming pattern is more specific than win_security_service_install_non_standard_path. Both rules should be deployed — they catch different aspects of the same stage."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_guid_named_transient_service_creation/unit-test.md"
+    notes:         "Create a GUID-named service using sc.exe in isolated environment: sc.exe create {12345678-1234-1234-1234-123456789012} binPath= C:\\Windows\\System32\\cmd.exe. Confirm Event ID 4697 fires and alert triggers. Delete service after test."
+  back_test:
+    status:        "PENDING"
+    period_days:   7
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_guid_named_transient_service_creation/back-test.md"
+    notes:         "Run against 7 days of SecurityEvent 4697. GUID-named services should be rare — any results warrant investigation before exclusion."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — requires BlueHammer Stage 7 execution"
+    atomic_test_ref:    "N/A"
+    evidence_path: "docs/test-evidence/win_security_guid_named_transient_service_creation/simulation-log.md"
+    notes:         "Execute BlueHammer with --force flag (technoherder/BlueHammerFix) to reach Stage 7. Confirm GUID-named service creation is captured in SecurityEvent 4697 and alert fires."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_guid_named_transient_service_creation-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. KQL adaptation of technoherder/BlueHammerFix bluehammer_temp_service_creation.yml Sigma rule. Credit: https://github.com/technoherder/BlueHammerFix"

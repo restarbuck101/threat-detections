@@ -1,0 +1,235 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# ── CREDIT ───────────────────────────────────────────────────────────────────
+# Detection concept sourced from technoherder/BlueHammerFix
+# https://github.com/technoherder/BlueHammerFix
+# Original Sigma rule: bluehammer_lsa_bootkey_access.yml
+# Author: Red Team (technoherder)
+#
+# This rule is a Sentinel KQL adaptation of their detection concept,
+# back-tested against production telemetry with FP guidance added.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_lsa_bootkey_registry_access_non_lsass"
+title: "LSA Boot Key Registry Access by Non-LSASS Process"
+description: |
+  Detects access to the four LSA boot key component registry keys (JD, Skew1,
+  GBG, Data) under HKLM\SYSTEM\CurrentControlSet\Control\Lsa from a process
+  other than lsass.exe.
+
+  These four keys contain class name data that, when combined and permuted,
+  yields the 16-byte SYSKEY (system boot key) used to decrypt the SAM database.
+  BlueHammer reads these keys to reconstruct the boot key and decrypt the NTLM
+  hashes it extracted from the VSS-accessible SAM hive.
+
+  Under normal Windows operation, only lsass.exe and system processes read these
+  keys. Access from any other process — particularly an interactive user-context
+  process — is a high-confidence indicator of credential extraction activity,
+  independent of BlueHammer.
+
+  Credit: Detection concept from technoherder/BlueHammerFix (bluehammer_lsa_bootkey_access.yml)
+  https://github.com/technoherder/BlueHammerFix
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering — KQL adaptation of technoherder/BlueHammerFix Sigma rule"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "Critical"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0006"    # Credential Access
+  techniques:
+    - "T1003.002" # OS Credential Dumping: SAM
+    - "T1552.002" # Unsecured Credentials: Credentials in Registry
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "DeviceRegistryEvents (MDE via XDR Connector)"
+  - "Requires MDE registry event telemetry enabled"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+# NOTE: Registry telemetry visibility for HKLM\SYSTEM\...\Lsa subkeys varies by
+# EDR configuration. Validate that DeviceRegistryEvents captures these specific
+# key reads in your environment before deploying.
+# Test with: DeviceRegistryEvents | where RegistryKey has "Control\\Lsa" | take 10
+query: |
+  DeviceRegistryEvents
+  | where TimeGenerated > ago(1h)
+  | where RegistryKey has_all ("Control", "Lsa")
+  | where RegistryKey has_any (
+      "\\Lsa\\JD",
+      "\\Lsa\\Skew1",
+      "\\Lsa\\GBG",
+      "\\Lsa\\Data"
+  )
+  | where InitiatingProcessFileName !in~ (
+      "lsass.exe",
+      "svchost.exe",
+      "services.exe",
+      "regedit.exe",
+      "reg.exe"
+  )
+  | where InitiatingProcessAccountSid != "S-1-5-18"
+  | where InitiatingProcessAccountName !endswith "$"
+  | project
+      TimeGenerated,
+      DeviceName,
+      RegistryKey,
+      RegistryValueName,
+      ActionType,
+      InitiatingProcessAccountName,
+      InitiatingProcessAccountDomain,
+      InitiatingProcessFileName,
+      InitiatingProcessFolderPath,
+      InitiatingProcessCommandLine,
+      InitiatingProcessParentFileName
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT5M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  false
+suppression_duration: "PT1H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT1H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "InitiatingProcessAccountName"
+      - identifier: "NTDomain"
+        column:     "InitiatingProcessAccountDomain"
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "DeviceName"
+  - entity_type: "RegistryKey"
+    field_mappings:
+      - identifier: "Key"
+        column:     "RegistryKey"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Registry Key":    "RegistryKey"
+  "Action Type":     "ActionType"
+  "Process":         "InitiatingProcessFileName"
+  "Command Line":    "InitiatingProcessCommandLine"
+  "Parent Process":  "InitiatingProcessParentFileName"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "AlertPerResult"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  Expected FP rate is very low. The LSA boot key component keys are structural
+  Windows internals not normally accessed by user-space applications.
+
+  Known FP scenarios:
+  - Registry backup tools reading the full SYSTEM hive — these typically run
+    under SYSTEM or backup service accounts which are filtered by the AccountSid
+    exclusion. If a backup agent runs under a named service account (not SYSTEM),
+    add it to the process exclusion list.
+  - System hardening audit tools (CIS benchmark scanners, security posture tools)
+    that enumerate LSA configuration — verify against your security tooling
+    inventory and add confirmed tools to the exclusion list.
+  - regedit.exe and reg.exe are excluded by default — if an admin is manually
+    browsing these keys that is low risk but worth noting in investigation.
+
+  Four-key access pattern: If all four keys (JD, Skew1, GBG, Data) are accessed
+  by the same process within a short window, that is the boot key reconstruction
+  sequence. This pattern has essentially no legitimate explanation outside of
+  lsass.exe and constitutes a Critical indicator regardless of process name.
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  This is a Critical indicator. Treat as active credential extraction.
+  1. Identify the process from alert custom details.
+  2. Check how many of the four boot key components (JD, Skew1, GBG, Data)
+     were accessed. All four = confirmed boot key reconstruction attempt.
+  3. Pull the 30-minute process timeline on the affected host:
+     DeviceProcessEvents | where DeviceName == "<host>"
+     | where Timestamp > ago(30m) | order by Timestamp asc
+  4. Check for correlated BlueHammer indicators in the same window:
+     - DeviceFileEvents with HarddiskVolumeShadowCopy in FolderPath
+     - samlib.dll load by same process
+     - Event IDs 4723/4724 on any local admin account
+  5. If correlated with VSS access: local NTLM hash extraction is complete.
+     Assume all local account credentials on this host are compromised.
+  6. Isolate host via MDE and escalate to Tier 2 / IR immediately.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1003.002"
+    description:  "SAM hive read from VSS snapshot. Boot key needed to decrypt the hive contents."
+    detection_id: "win_security_vss_registry_hive_shadow_copy_access"
+  following_technique:
+    mitre_id:     "T1098"
+    description:  "NTLM hash decrypted using recovered boot key. samlib.dll loaded. SamiChangePasswordUser called to authenticate as local admin."
+    detection_id: "win_security_samlib_load_non_lsass_process"
+  coverage_assessment: "Covers Steps 5-6 of 8 in the BlueHammer chain — boot key extraction fires concurrently with SAM hive access, before password manipulation begins."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_lsa_bootkey_registry_access_non_lsass/unit-test.md"
+    notes: |
+      First validate registry telemetry is captured:
+        DeviceRegistryEvents | where RegistryKey has "Control\\Lsa" | take 10
+      If no results, registry event telemetry may not be capturing these keys.
+      Unit test: write a test script that reads the four LSA keys using RegOpenKeyEx
+      from a standard user context in isolated environment. Confirm DeviceRegistryEvents
+      record and alert fires.
+  back_test:
+    status:        "PENDING"
+    period_days:   7
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_lsa_bootkey_registry_access_non_lsass/back-test.md"
+    notes:         "Verify DeviceRegistryEvents captures LSA key reads in your environment before running back-test. Run against 7 days. Expect low volume — document any FP sources and add to exclusion list."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — requires BlueHammer Stage 6 execution"
+    atomic_test_ref:    "N/A"
+    evidence_path: "docs/test-evidence/win_security_lsa_bootkey_registry_access_non_lsass/simulation-log.md"
+    notes:         "Execute BlueHammer with --force flag (technoherder/BlueHammerFix) to reach Stage 6. Confirm DeviceRegistryEvents fires for all four boot key components from the exploit process."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_lsa_bootkey_registry_access_non_lsass-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. KQL adaptation of technoherder/BlueHammerFix bluehammer_lsa_bootkey_access.yml Sigma rule. Credit: https://github.com/technoherder/BlueHammerFix"

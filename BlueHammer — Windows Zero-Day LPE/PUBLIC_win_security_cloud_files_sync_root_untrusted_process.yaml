@@ -1,0 +1,217 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_cloud_files_sync_root_untrusted_process"
+title: "Cloud Files Sync Root Registered by Untrusted Process"
+description: |
+  Detects cldapi.dll (Windows Cloud Files API) being loaded by a process outside
+  of known, approved cloud synchronization software. In the BlueHammer LPE exploit
+  chain this API is used to register a sync root and create a callback that freezes
+  Microsoft Defender at a precise moment — holding a VSS snapshot open while
+  credential extraction proceeds.
+
+  CfRegisterSyncRoot is not commonly invoked by general-purpose applications.
+  Loading of cldapi.dll by untrusted processes warrants investigation independent
+  of BlueHammer, as it may indicate other Cloud Files API abuse techniques.
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "High"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0004"    # Privilege Escalation
+    - "TA0005"    # Defense Evasion
+  techniques:
+    - "T1068"     # Exploitation for Privilege Escalation
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "DeviceImageLoadEvents (MDE via XDR Connector — Microsoft Defender XDR data connector required in Sentinel)"
+  - "Requires MDE Advanced Hunting image load telemetry to be enabled"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+# CUSTOMIZE: Add any additional approved cloud sync processes for your environment
+query: |
+  let ApprovedSyncProcesses = dynamic([
+      "onedrive.exe",
+      "googledrivefs.exe",
+      "dropbox.exe",
+      "boxsync.exe",
+      "filesync.exe",
+      "sharepoint.exe",
+      "icloudservices.exe",
+      "svchost.exe",
+      "explorer.exe",
+      "mobsync.exe"
+      // Add environment-specific approved cloud sync processes here
+  ]);
+  DeviceImageLoadEvents
+  | where TimeGenerated > ago(1h)
+  | where FileName =~ "cldapi.dll"
+  | where InitiatingProcessAccountSid != "S-1-5-18"
+  | where InitiatingProcessAccountName !endswith "$"
+  | where InitiatingProcessFileName !in~ (ApprovedSyncProcesses)
+  | project
+      TimeGenerated,
+      DeviceName,
+      InitiatingProcessAccountName,
+      InitiatingProcessAccountDomain,
+      InitiatingProcessFileName,
+      InitiatingProcessFolderPath,
+      InitiatingProcessCommandLine,
+      InitiatingProcessParentFileName
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT5M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  false
+suppression_duration: "PT1H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT1H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "InitiatingProcessAccountName"
+      - identifier: "NTDomain"
+        column:     "InitiatingProcessAccountDomain"
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "DeviceName"
+  - entity_type: "Process"
+    field_mappings:
+      - identifier: "ProcessId"
+        column:     "InitiatingProcessFileName"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Initiating Process":  "InitiatingProcessFileName"
+  "Process Folder":      "InitiatingProcessFolderPath"
+  "Command Line":        "InitiatingProcessCommandLine"
+  "Parent Process":      "InitiatingProcessParentFileName"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "AlertPerResult"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  Expected FP rate is low. Known legitimate loaders of cldapi.dll are already
+  excluded in the ApprovedSyncProcesses list.
+
+  If a new enterprise cloud sync or backup product is deployed that legitimately
+  loads cldapi.dll, add it to the ApprovedSyncProcesses dynamic list. Document
+  the addition with the product name and business justification.
+
+  Do not exclude development tools (Visual Studio, Python, etc.) without
+  investigation — legitimate development tools do not normally load the Cloud
+  Files API.
+
+  Verify table availability before deployment:
+  search in (DeviceImageLoadEvents) "*" | take 1
+  If the table does not exist, enable it in the Microsoft Defender XDR
+  data connector under Data Connectors in Sentinel.
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  1. Identify the initiating process from alert entities and custom details.
+  2. Is InitiatingProcessFolderPath in a standard install location
+     (C:\Program Files, C:\Windows) or a user-writable location
+     (AppData, Temp, Downloads)? User-writable path = high confidence malicious.
+  3. Is the parent process expected for this initiating process?
+     An unusual parent chain is an escalation indicator.
+  4. Check the same host in the 30-minute window around the alert for:
+     - DeviceFileEvents with HarddiskVolumeShadowCopy in FolderPath
+     - SecurityEvent EventID 4697 (service install)
+     - SecurityEvent EventID 4723/4724 on admin accounts
+  5. If any of the above are also present: isolate the host via MDE
+     immediately — full BlueHammer chain may be in progress.
+  6. If the process is a legitimate enterprise tool: verify with software
+     inventory, add exclusion, close as FP with documentation.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1082"
+    description:  "Attacker enumerates VSS shadow copies in a worker thread waiting for the Defender-created snapshot."
+    detection_id: "win_security_vss_shadow_copy_enumeration_user_space"
+  following_technique:
+    mitre_id:     "T1003.002"
+    description:  "With Defender frozen via oplock, attacker reads SAM/SYSTEM/SECURITY hives from mounted VSS snapshot."
+    detection_id: "win_security_vss_registry_hive_shadow_copy_access"
+  coverage_assessment: "Covers Step 3 of 8 in the BlueHammer chain. Steps 2 and 4 (RstrtMgr oplock and RPC+Junction) require Sysmon or advanced EDR telemetry — see technoherder/BlueHammerFix Sigma rules."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_cloud_files_sync_root_untrusted_process/unit-test.md"
+    notes: |
+      Execute in isolated test environment. PowerShell wrapper to trigger cldapi.dll load:
+        Add-Type @"
+          using System.Runtime.InteropServices;
+          public class CloudFilesTest {
+            [DllImport("cldapi.dll")]
+            public static extern int CfRegisterSyncRoot(
+              string SyncRootPath, IntPtr Registration,
+              IntPtr Policies, uint RegisterFlags);
+          }
+        "@
+        $testDir = "C:\Temp\cftest"
+        New-Item -ItemType Directory -Force -Path $testDir | Out-Null
+        [CloudFilesTest]::CfRegisterSyncRoot($testDir, [IntPtr]::Zero, [IntPtr]::Zero, 0)
+      Call will fail with access denied — the DLL load event is what we are testing.
+  back_test:
+    status:        "PASS"
+    period_days:   7
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_cloud_files_sync_root_untrusted_process/back-test.md"
+    notes:         "Back-test conducted April 8 2026. Zero results over 7 days."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — custom module required"
+    atomic_test_ref:    "N/A"
+    evidence_path: "docs/test-evidence/win_security_cloud_files_sync_root_untrusted_process/simulation-log.md"
+    notes:         "Execute PowerShell unit test above in isolated environment with MDE active. Confirm DeviceImageLoadEvents record and alert fires."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_cloud_files_sync_root_untrusted_process-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. BlueHammer zero-day response. Back-test complete April 8 2026 — 7 days clean."

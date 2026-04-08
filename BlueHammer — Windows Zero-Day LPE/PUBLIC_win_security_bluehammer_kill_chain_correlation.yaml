@@ -1,0 +1,287 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# ── COMPOSITE RULE — READ BEFORE DEPLOYING ────────────────────────────────────
+# This rule depends on the eight individual BlueHammer detection rules being
+# active and generating alerts in your Sentinel workspace. It queries the
+# SecurityAlert table which is only populated by active analytics rule alerts.
+#
+# DEPLOY ORDER:
+#   1. Deploy individual rules (all eight below)
+#   2. Run adversary simulation to confirm individual rules fire
+#   3. Deploy THIS rule after individual rules are active
+#
+#   Individual rules:
+#     win_security_vss_shadow_copy_enumeration_user_space
+#     win_security_cloud_files_sync_root_untrusted_process
+#     win_security_vss_registry_hive_shadow_copy_access
+#     win_security_lsa_bootkey_registry_access_non_lsass
+#     win_security_samlib_load_non_lsass_process
+#     win_security_local_admin_password_rapid_change_restore
+#     win_security_service_install_non_standard_path
+#     win_security_guid_named_transient_service_creation
+#
+# VERIFY DEPENDENCY:
+#   SecurityAlert
+#   | where TimeGenerated > ago(7d)
+#   | where AlertName in (
+#       "Volume Shadow Copy Enumeration from User-Space Process",
+#       "Cloud Files Sync Root Registered by Untrusted Process",
+#       "Registry Hive Access via Volume Shadow Copy Path",
+#       "LSA Boot Key Registry Access by Non-LSASS Process",
+#       "samlib.dll Loaded by Non-LSASS Process",
+#       "Local Administrator Password Rapid Change and Restore",
+#       "Windows Service Installed from Non-Standard Path",
+#       "GUID-Named Transient Service Created for SYSTEM Escalation"
+#   )
+#   | summarize count() by AlertName
+#   All eight should return results before deploying this rule.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_bluehammer_kill_chain_correlation"
+title: "BlueHammer Kill Chain Correlation — Multiple Indicators Same Host"
+description: |
+  Correlates multiple BlueHammer-specific indicators firing on the same host
+  within a 30-minute window. BlueHammer is an unpatched Windows local privilege
+  escalation zero-day (public PoC April 3, 2026) that chains Defender VSS abuse,
+  Cloud Files API freezing, SAM credential dumping, and transient service creation
+  to escalate a standard user to NT AUTHORITY\SYSTEM.
+
+  Individual detections for each chain step exist as standalone rules. This
+  composite rule fires when two or more of those indicators appear on the same
+  host within 30 minutes — a combination that has no legitimate explanation and
+  indicates active exploitation in progress or recently completed.
+
+  If this alert fires: treat as an active incident and isolate the host
+  immediately.
+
+  Individual rules correlated:
+    1. win_security_vss_shadow_copy_enumeration_user_space (High)
+    2. win_security_cloud_files_sync_root_untrusted_process (High)
+    3. win_security_vss_registry_hive_shadow_copy_access (Critical)
+    4. win_security_lsa_bootkey_registry_access_non_lsass (Critical)
+    5. win_security_samlib_load_non_lsass_process (High)
+    6. win_security_local_admin_password_rapid_change_restore (Critical)
+    7. win_security_service_install_non_standard_path (High)
+    8. win_security_guid_named_transient_service_creation (High)
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "Critical"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0006"    # Credential Access
+    - "TA0004"    # Privilege Escalation
+    - "TA0003"    # Persistence
+    - "TA0005"    # Defense Evasion
+  techniques:
+    - "T1003.002" # SAM credential dumping
+    - "T1068"     # Exploitation for Privilege Escalation
+    - "T1098"     # Account Manipulation
+    - "T1134.001" # Token Impersonation/Theft
+    - "T1543.003" # Windows Service
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "SecurityAlert (Sentinel alerts table — requires individual BlueHammer rules to be active)"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+# NOTE: Entity extraction from SecurityAlert Entities JSON may need adjustment
+# depending on how Sentinel serializes entities for each individual rule.
+# Validate HostName field populates correctly during testing.
+query: |
+  let BlueHammerRules = dynamic([
+      "Volume Shadow Copy Enumeration from User-Space Process",
+      "Cloud Files Sync Root Registered by Untrusted Process",
+      "Registry Hive Access via Volume Shadow Copy Path",
+      "LSA Boot Key Registry Access by Non-LSASS Process",
+      "samlib.dll Loaded by Non-LSASS Process",
+      "Local Administrator Password Rapid Change and Restore",
+      "Windows Service Installed from Non-Standard Path",
+      "GUID-Named Transient Service Created for SYSTEM Escalation"
+  ]);
+  let CorrelationWindow = 30m;
+  SecurityAlert
+  | where TimeGenerated > ago(1h)
+  | where AlertName in (BlueHammerRules)
+  | extend HostName = tostring(parse_json(Entities)
+      | where Type == "host"
+      | project HostName)[0]
+  | extend AccountName = tostring(parse_json(Entities)
+      | where Type == "account"
+      | project Name)[0]
+  | summarize
+      AlertCount        = count(),
+      FiredRules        = make_set(AlertName),
+      AffectedAccounts  = make_set(AccountName),
+      FirstAlert        = min(TimeGenerated),
+      LastAlert         = max(TimeGenerated),
+      AlertIds          = make_set(SystemAlertId)
+      by HostName
+  | where AlertCount >= 2
+  | extend WindowMinutes = datetime_diff('minute', LastAlert, FirstAlert)
+  | where WindowMinutes <= 30
+  | extend
+      RuleCount     = array_length(FiredRules),
+      ChainCoverage = strcat(tostring(AlertCount), " of 5 BlueHammer indicators fired")
+  | project
+      HostName,
+      AlertCount,
+      RuleCount,
+      ChainCoverage,
+      FiredRules,
+      AffectedAccounts,
+      FirstAlert,
+      LastAlert,
+      WindowMinutes,
+      AlertIds
+  | order by AlertCount desc
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT5M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  true
+suppression_duration: "PT2H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT2H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "HostName"
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "AffectedAccounts"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Alert Count":      "AlertCount"
+  "Chain Coverage":   "ChainCoverage"
+  "Rules Fired":      "FiredRules"
+  "Window (minutes)": "WindowMinutes"
+  "First Alert":      "FirstAlert"
+  "Last Alert":       "LastAlert"
+  "Alert IDs":        "AlertIds"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "SingleAlert"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  Expected FP rate is extremely low — approaching zero. Two or more BlueHammer-
+  specific behavioral indicators on the same host within 30 minutes has no
+  legitimate operational explanation.
+
+  The only known FP scenario is your isolated testing environment during
+  adversary simulation campaigns. When running BlueHammer emulation modules
+  sequentially, this rule will fire. This is expected and validates the
+  composite detection is working. Suppress manually for the duration of
+  test campaigns on your test hosts.
+
+  If this alert fires on any production host: treat as active P1 incident.
+  Do not close as FP without full IR investigation.
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  ACTIVE INCIDENT — DO NOT CLOSE WITHOUT IR INVESTIGATION.
+
+  IMMEDIATE ACTIONS (within 5 minutes):
+  1. Isolate the host via MDE: Security.microsoft.com -> Devices ->
+     [HostName] -> Isolate Device.
+  2. Note which rules fired from FiredRules — shows how far into the
+     chain the attacker progressed.
+  3. Escalate to Tier 2 / IR with: host name, alert count, fired rules,
+     window duration, affected accounts.
+
+  INVESTIGATION (Tier 2 / IR):
+  4. Pull 2-hour process timeline on affected host in Advanced Hunting:
+     DeviceProcessEvents | where DeviceName == "<host>"
+     | where Timestamp > ago(2h) | order by Timestamp asc
+  5. Check for SYSTEM-level shells (cmd.exe, powershell.exe as
+     NT AUTHORITY\SYSTEM) in the alert window. If present, SYSTEM
+     access was obtained.
+  6. Check for lateral movement: DeviceNetworkEvents for SMB (port 445)
+     connections from the host to other internal hosts.
+  7. Assume all local NTLM hashes on the affected host are compromised.
+     Initiate local admin password rotation immediately.
+  8. If SYSTEM access confirmed: host is fully compromised. Check for
+     additional hosts where the same account logged in within 24 hours.
+
+  CONTAINMENT:
+  9. Preserve forensic evidence before remediation.
+  10. Rebuild from clean image after forensics. Do not re-join domain
+      until initial access vector is identified and closed.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1566.001"
+    description:  "Initial access establishes low-privileged foothold."
+    detection_id: "Covered by existing phishing and initial access detections"
+  following_technique:
+    mitre_id:     "T1021.002"
+    description:  "Post-SYSTEM lateral movement via SMB/Admin shares."
+    detection_id: "NONE — lateral movement detection gap"
+  coverage_assessment: "Composite coverage of full BlueHammer chain. Fires when 2+ of 8 individual chain-step detections trigger on the same host within 30 minutes."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_bluehammer_kill_chain_correlation/unit-test.md"
+    notes:         "Requires all eight individual BlueHammer rules active in workspace. Execute at least two adversary simulation modules sequentially within 30 minutes on a test host. Confirm individual rules fire first, then confirm this composite rule fires. Validate HostName entity extraction is populating correctly — adjust Entities JSON path if empty."
+  back_test:
+    status:        "N/A"
+    period_days:   0
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_bluehammer_kill_chain_correlation/back-test.md"
+    notes:         "Not applicable. Queries SecurityAlert which is only populated by active analytics rule alerts. No historical data exists pre-deployment. Validation is via adversary simulation."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — requires sequential execution of multiple modules"
+    atomic_test_ref:    "N/A"
+    evidence_path: "docs/test-evidence/win_security_bluehammer_kill_chain_correlation/simulation-log.md"
+    notes:         "Run at least two BlueHammer emulation modules sequentially on test host within 30 minutes. Confirm: (1) individual rules fire, (2) composite rule fires, (3) HostName field populates correctly. Adjust Entities JSON extraction if HostName is empty."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_bluehammer_kill_chain_correlation-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. BlueHammer zero-day response. Composite correlation rule — deploy after individual rules are active."

@@ -1,0 +1,208 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# BlueHammer: Unpatched Windows LPE (public PoC April 3, 2026)
+# Abuses Defender VSS workflow + Cloud Files API + oplocks to escalate
+# a standard user to NT AUTHORITY\SYSTEM
+#
+# Full kill chain documentation and hunt guide available alongside this rule.
+#
+# ── NAMING CONVENTION ────────────────────────────────────────────────────────
+# Sigma convention:
+#   Filename:  win_security_vss_registry_hive_shadow_copy_access.yaml
+#   id:        win_security_vss_registry_hive_shadow_copy_access
+#   title:     Registry Hive Access via Volume Shadow Copy Path
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_vss_registry_hive_shadow_copy_access"
+title: "Registry Hive Access via Volume Shadow Copy Path"
+description: |
+  Detects a non-system process directly reading the SAM, SYSTEM, or SECURITY
+  registry hives from a Volume Shadow Copy device path. During normal operations
+  these hive files are locked and inaccessible at runtime. Access via a shadow
+  copy path indicates an attacker has abused VSS to bypass this lock and extract
+  credential material.
+
+  This is the highest-confidence indicator in the BlueHammer LPE exploit chain
+  (CVE pending, unpatched as of April 2026) and applies broadly to any
+  VSS-based credential dumping technique targeting local accounts.
+
+  Back-tested against 30 days of production DeviceFileEvents — zero results
+  confirmed clean environment prior to deployment.
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "Critical"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0006"        # Credential Access
+  techniques:
+    - "T1003.002"     # OS Credential Dumping: Security Account Manager
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "DeviceFileEvents (MDE via XDR Connector — Microsoft Defender XDR data connector required in Sentinel)"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+query: |
+  DeviceFileEvents
+  | where TimeGenerated > ago(1h)
+  | where FolderPath has "HarddiskVolumeShadowCopy"
+  | where FolderPath has_any (
+      "\\Config\\SAM",
+      "\\Config\\SYSTEM",
+      "\\Config\\SECURITY"
+  )
+  | where InitiatingProcessAccountSid != "S-1-5-18"
+  | where InitiatingProcessAccountName !endswith "$"
+  | where isnotempty(InitiatingProcessAccountName)
+  | project
+      TimeGenerated,
+      DeviceName,
+      InitiatingProcessAccountName,
+      InitiatingProcessAccountDomain,
+      InitiatingProcessFileName,
+      InitiatingProcessFolderPath,
+      InitiatingProcessCommandLine,
+      FolderPath,
+      FileName,
+      ActionType
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT5M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  false
+suppression_duration: "PT1H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT1H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "InitiatingProcessAccountName"
+      - identifier: "NTDomain"
+        column:     "InitiatingProcessAccountDomain"
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "DeviceName"
+  - entity_type: "Process"
+    field_mappings:
+      - identifier: "ProcessId"
+        column:     "InitiatingProcessFileName"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Shadow Copy Path":   "FolderPath"
+  "Hive File":          "FileName"
+  "Initiating Process": "InitiatingProcessFileName"
+  "Command Line":       "InitiatingProcessCommandLine"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "AlertPerResult"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  Expected FP rate is very low. There is no known legitimate use case for a
+  non-system process reading SAM, SYSTEM, or SECURITY hives from a VSS device
+  path at runtime. Possible exceptions:
+
+  - Approved forensic tooling (FTK, Velociraptor, KAPE) run by IR team members
+    during an authorized investigation — verify against active IR tickets.
+  - Backup agents that access VSS snapshots for registry backup — these should
+    run under SYSTEM or a service account (filtered by AccountSid exclusion).
+    If a backup agent is identified as a FP source, add its executable to an
+    approved backup agents watchlist and add a filter line.
+
+  Any hit from an interactive user account should be treated as a true positive
+  until proven otherwise. Escalate immediately.
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  This alert is Critical severity. Treat as active credential theft until ruled out.
+  1. Identify the host and account from alert entities.
+  2. Pull the full process tree for InitiatingProcessFileName on the affected
+     device in Advanced Hunting (DeviceProcessEvents | where DeviceName ==
+     "<host>" | where Timestamp > ago(2h) | order by Timestamp asc).
+  3. Check whether the host shows any of the following in the same window:
+     - cldapi.dll loaded by the initiating process (BlueHammer indicator)
+     - Event ID 4697 (service installed) on the same host
+     - Event IDs 4723/4724 (password change) on any local admin account
+  4. Check the initiating process against your approved backup agent list.
+  5. If the process is not an approved backup tool: isolate the host via MDE
+     immediately and escalate to Tier 2 / IR.
+  6. Assume local NTLM hashes on the affected host are compromised. Initiate
+     local admin password rotation for all local accounts.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1068"
+    description:  "Defender frozen via Cloud Files API oplock. VSS snapshot mounted and held open."
+    detection_id: "win_security_cloud_files_sync_root_untrusted_process"
+  following_technique:
+    mitre_id:     "T1552.002"
+    description:  "LSA boot key components (JD/Skew1/GBG/Data) read to reconstruct SYSKEY for NTLM hash decryption."
+    detection_id: "win_security_lsa_bootkey_registry_access_non_lsass"
+  coverage_assessment: "Covers Step 5 of 8 in the BlueHammer chain. Fires concurrently with win_security_lsa_bootkey_registry_access_non_lsass — both steps happen during the same SAM extraction phase."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_vss_registry_hive_shadow_copy_access/unit-test.md"
+    notes:         "Synthetic test case: copy SAM hive from a shadow copy path using a standard user account in an isolated test environment."
+  back_test:
+    status:        "PASS"
+    period_days:   30
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_vss_registry_hive_shadow_copy_access/back-test.md"
+    notes:         "Back-test conducted April 8 2026. Query run against 30 days of DeviceFileEvents. Zero results — environment confirmed clean across the full post-disclosure window."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — custom atomic module required"
+    atomic_test_ref:    "N/A"
+    evidence_path: "docs/test-evidence/win_security_vss_registry_hive_shadow_copy_access/simulation-log.md"
+    notes:         "Execute in isolated test environment: copy SAM hive from a VSS device path as a standard user while MDE telemetry is active. Confirm DeviceFileEvents alert fires."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_vss_registry_hive_shadow_copy_access-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. BlueHammer zero-day response. Back-test complete April 8 2026 — 30 days clean."

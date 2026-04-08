@@ -1,0 +1,234 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# ── ENVIRONMENT NOTE ─────────────────────────────────────────────────────────
+# This rule was tuned against production data prior to release. The query uses
+# a four-tier exclusion model:
+#   Tier 1: Case-insensitive regex for all standard Windows path forms
+#   Tier 2: ApprovedEnterprisePaths — customize for your environment
+#   Tier 3: Named service exclusions — customize for your environment
+#   Tier 4: Specific scoped exclusions — customize for your environment
+#
+# IMPORTANT: EventData for Event ID 4697 may include surrounding double-quote
+# characters on ServiceFileName depending on how your SIEM parses it. The
+# trim('"', ...) call handles this. Test in your environment and remove if
+# not needed.
+#
+# IMPORTANT: The SubjectAccount field name in EventData JSON varies by
+# environment. Confirm the correct key name by running:
+#   SecurityEvent | where EventID == 4697 | project EventData | take 1
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_service_install_non_standard_path"
+title: "Windows Service Installed from Non-Standard Path"
+description: |
+  Detects a Windows service installed with a binary path outside of standard
+  system directories. BlueHammer creates a transient service from an attacker-
+  controlled binary to spawn a SYSTEM-level shell. The service is short-lived
+  and self-removing, making it visible only in Event ID 4697.
+
+  This detection also covers other LPE and persistence techniques that abuse
+  service creation from user-writable locations (AppData, Temp, arbitrary paths).
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "High"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0004"    # Privilege Escalation
+    - "TA0003"    # Persistence
+  techniques:
+    - "T1543.003" # Create or Modify System Process: Windows Service
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "SecurityEvent — Windows Security Event Log (Event ID 4697)"
+  - "Requires audit policy: Audit Security System Extension = Success"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+query: |
+  // ── CUSTOMIZE: Add your environment's approved non-standard paths ──────────
+  // These are paths confirmed as legitimate enterprise software installed
+  // outside of standard Program Files / Windows directories.
+  // Examples: custom application directories, vendor-specific install paths.
+  let ApprovedEnterprisePaths = dynamic([
+      // @"C:\CustomApp\",       // Example: add your environment's paths here
+      // @"D:\VendorApp\"        // Example: non-C: drive enterprise installs
+  ]);
+  // ── CUSTOMIZE: Add known legitimate transient service names ────────────────
+  // Services that are known-good but install from non-standard paths.
+  // Common examples: remote execution agents, installer helpers.
+  let ApprovedServiceNames = dynamic([
+      // "KnownTransientService"   // Add environment-specific approved services
+  ]);
+  SecurityEvent
+  | where TimeGenerated > ago(1h)
+  | where EventID == 4697
+  // Extract fields from EventData JSON — key names may vary by environment
+  | extend ServiceFileName = trim('"', tostring(parse_json(EventData).Service_Information_Service_File_Name))
+  | extend ServiceName     = tostring(parse_json(EventData).Service_Information_Service_Name)
+  | extend ServiceAccount  = tostring(parse_json(EventData).Service_Information_Service_Account)
+  | extend SubjectAccount  = tostring(parse_json(EventData).SubjectAccountName)
+  | where SubjectAccount !endswith "$"
+  | where isnotempty(ServiceFileName)
+  // Tier 1: Regex — handles all standard path forms case-insensitively
+  // Covers: C:\Windows, C:\Program Files (x86), \SystemRoot\, PROGRA~N short names
+  | where not(ServiceFileName matches regex
+      @"(?i)^([A-Z]:\\(Windows|Program\sFiles(\s\(x86\))?|ProgramData|PROGRA~\d)|\\\\?SystemRoot\\|system32\\)")
+  // Tier 2: Approved enterprise paths (customize for your environment)
+  | where not(ServiceFileName has_any (ApprovedEnterprisePaths))
+  // Tier 3: Approved service names (customize for your environment)
+  | where ServiceName !in~ (ApprovedServiceNames)
+  | project
+      TimeGenerated,
+      Computer,
+      SubjectAccount,
+      ServiceName,
+      ServiceFileName,
+      ServiceAccount
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT15M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  false
+suppression_duration: "PT1H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT1H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "SubjectAccount"
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "Computer"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Service Name":    "ServiceName"
+  "Service Binary":  "ServiceFileName"
+  "Service Account": "ServiceAccount"
+  "Installing User": "SubjectAccount"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "AlertPerResult"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  This rule will generate FPs in most environments until tuned against your
+  specific software inventory. Recommended tuning process:
+
+  1. Run the query over 7-30 days and collect all results.
+  2. Categorize each result:
+     - Standard system path variants missed by regex (add to regex or path list)
+     - Known enterprise software in non-standard locations (add to ApprovedEnterprisePaths)
+     - Known legitimate transient services (add to ApprovedServiceNames)
+     - Unknown or suspicious entries (investigate before excluding)
+  3. Common FP categories to expect:
+     - Installer helpers that create temp services from AppData or Temp during
+       software installation — verify against software deployment activity
+     - Vendor software installed on non-C: drives or custom directories
+     - Remote management agents that register short-lived services
+     - Hardware driver installers that drop kernel drivers from Temp paths
+  4. Do not exclude service binaries from user profile paths (AppData, Temp,
+     Desktop) without confirming the specific software and account. These
+     paths are exactly where BlueHammer-style attacks operate.
+
+  HIGH RISK patterns that should always be investigated regardless of context:
+  - Service binary in C:\Users\[user]\AppData\ or C:\Users\[user]\[Temp]\
+    installed by an interactive user account (not a service or system account)
+  - Service binary with a random or meaningless name
+  - Service that appears and is immediately removed (short lifetime)
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  1. Review ServiceFileName and ServiceName from alert details.
+  2. Identify SubjectAccount — is this a known admin, installer account, or
+     an unexpected interactive user?
+  3. Is the service binary path in a user-writable location (AppData, Temp,
+     Desktop, Downloads)? If yes, escalate.
+  4. Pull the process timeline on the affected host in the 15 minutes around
+     the alert time in Advanced Hunting:
+     DeviceProcessEvents | where DeviceName == "<host>"
+     | where Timestamp between (<AlertTime-5m> .. <AlertTime+5m>)
+     | order by Timestamp asc
+  5. Look for cmd.exe or powershell.exe running as NT AUTHORITY\SYSTEM in the
+     same window — indicates BlueHammer service execution succeeded.
+  6. If service binary is in Temp or AppData AND a SYSTEM shell is present:
+     isolate host via MDE and escalate to Tier 2 / IR immediately.
+  7. If the binary is a known enterprise tool in a non-standard location:
+     document as FP and add exclusion to the query.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1098"
+    description:  "Local admin password reset and restored. Admin token obtained and SYSTEM token duplicated."
+    detection_id: "win_security_local_admin_password_rapid_change_restore"
+  following_technique:
+    mitre_id:     "T1003.001"
+    description:  "With SYSTEM access attacker may dump LSASS for domain credentials."
+    detection_id: "NONE — LSASS dump detection gap, flag for backlog"
+  coverage_assessment: "Covers Step 8 of 8 in the BlueHammer chain — broad coverage of non-standard path service installs. Deploy alongside win_security_guid_named_transient_service_creation which targets the GUID naming pattern specifically."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_service_install_non_standard_path/unit-test.md"
+    notes:         "Use Atomic Red Team T1543.003 Test 1 in isolated environment, or manually create a service from a Temp path using sc.exe. Confirm alert fires."
+  back_test:
+    status:        "PASS"
+    period_days:   7
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_service_install_non_standard_path/back-test.md"
+    notes:         "Back-test conducted April 8 2026. Environment-specific FP baseline established. Four-tier exclusion model applied. Query returns zero results after tuning. NOTE: This rule requires environment-specific tuning — expect FPs on initial deployment until ApprovedEnterprisePaths and ApprovedServiceNames are populated for your environment."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — Atomic Red Team T1543.003 or custom module"
+    atomic_test_ref:    "T1543.003 Test 1"
+    evidence_path: "docs/test-evidence/win_security_service_install_non_standard_path/simulation-log.md"
+    notes:         "Execute in isolated test environment. Confirm Event ID 4697 fires and alert surfaces in Sentinel."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_service_install_non_standard_path-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. BlueHammer zero-day response. Four-tier exclusion model with case-insensitive regex for system paths. trim() applied for EventData JSON quote handling. Back-test complete April 8 2026."

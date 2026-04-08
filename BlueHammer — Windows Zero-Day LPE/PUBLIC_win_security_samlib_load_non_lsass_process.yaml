@@ -1,0 +1,216 @@
+# Detection Rule — BlueHammer Zero-Day Response
+# Public release — sanitized for community sharing
+#
+# ── CREDIT ───────────────────────────────────────────────────────────────────
+# Detection concept sourced from technoherder/BlueHammerFix
+# https://github.com/technoherder/BlueHammerFix
+# Original Sigma rule: bluehammer_samlib_load.yml
+# Author: Red Team (technoherder)
+#
+# This rule is a Sentinel KQL adaptation of their detection concept,
+# back-tested against production telemetry with FP guidance added.
+# Their repo includes full static analysis, 9 PoC bug fixes, lab validation
+# of Stages 1-5, 7 Sigma rules, and 4 YARA rules. Essential companion reference.
+# ─────────────────────────────────────────────────────────────────────────────
+
+# ── IDENTITY ─────────────────────────────────────────────────────────────────
+id: "win_security_samlib_load_non_lsass_process"
+title: "samlib.dll Loaded by Non-LSASS Process"
+description: |
+  Detects samlib.dll being loaded by a process other than lsass.exe or known
+  system processes. samlib.dll exports SamiChangePasswordUser — the undocumented
+  function BlueHammer uses to forcibly reset a local administrator password using
+  a recovered NTLM hash (local pass-the-hash), then restore the original hash
+  after obtaining a SYSTEM token.
+
+  Under normal Windows operation, samlib.dll is loaded exclusively by lsass.exe,
+  winlogon.exe, LogonUI.exe, and a small set of system processes. Loading by
+  any other process — particularly an interactive user-context process — is
+  anomalous and indicates credential manipulation activity.
+
+  Credit: Detection concept from technoherder/BlueHammerFix (bluehammer_samlib_load.yml)
+  https://github.com/technoherder/BlueHammerFix
+
+# ── AUTHORSHIP ───────────────────────────────────────────────────────────────
+author: "Detection Engineering — KQL adaptation of technoherder/BlueHammerFix Sigma rule"
+created_date:  "2026-04-08"
+modified_date: "2026-04-08"
+
+# ── CLASSIFICATION ───────────────────────────────────────────────────────────
+severity:  "High"
+platform:  "Sentinel"
+workspace: "all"
+status:    "Testing"
+tier0:     false
+
+# ── MITRE ATT&CK ─────────────────────────────────────────────────────────────
+mitre_attack:
+  tactics:
+    - "TA0006"    # Credential Access
+    - "TA0004"    # Privilege Escalation
+  techniques:
+    - "T1003.002" # OS Credential Dumping: SAM
+    - "T1098"     # Account Manipulation
+
+# ── DATA SOURCES ─────────────────────────────────────────────────────────────
+data_sources:
+  - "DeviceImageLoadEvents (MDE via XDR Connector)"
+  - "Requires MDE image load telemetry enabled"
+
+# ── KQL QUERY ────────────────────────────────────────────────────────────────
+query: |
+  let ApprovedSamlibProcesses = dynamic([
+      "lsass.exe",
+      "svchost.exe",
+      "services.exe",
+      "winlogon.exe",
+      "LogonUI.exe",
+      "csrss.exe",
+      "wininit.exe"
+      // Add any additional legitimate loaders identified in your environment
+  ]);
+  DeviceImageLoadEvents
+  | where TimeGenerated > ago(1h)
+  | where FileName =~ "samlib.dll"
+  | where InitiatingProcessFileName !in~ (ApprovedSamlibProcesses)
+  | where InitiatingProcessAccountSid != "S-1-5-18"
+  | where InitiatingProcessAccountName !endswith "$"
+  | project
+      TimeGenerated,
+      DeviceName,
+      InitiatingProcessAccountName,
+      InitiatingProcessAccountDomain,
+      InitiatingProcessFileName,
+      InitiatingProcessFolderPath,
+      InitiatingProcessCommandLine,
+      InitiatingProcessParentFileName
+
+# ── SCHEDULE ─────────────────────────────────────────────────────────────────
+query_frequency: "PT5M"
+query_period:    "PT1H"
+
+# ── TRIGGER ──────────────────────────────────────────────────────────────────
+trigger_operator:  "GreaterThan"
+trigger_threshold: 0
+
+# ── SUPPRESSION ──────────────────────────────────────────────────────────────
+suppression_enabled:  false
+suppression_duration: "PT1H"
+
+# ── INCIDENT CONFIGURATION ───────────────────────────────────────────────────
+incident:
+  create: true
+  grouping:
+    enabled:           true
+    reopen_closed:     false
+    lookback_duration: "PT1H"
+    matching_method:   "AllEntities"
+    group_by_entities: []
+
+# ── ENTITY MAPPINGS ──────────────────────────────────────────────────────────
+entity_mappings:
+  - entity_type: "Account"
+    field_mappings:
+      - identifier: "Name"
+        column:     "InitiatingProcessAccountName"
+      - identifier: "NTDomain"
+        column:     "InitiatingProcessAccountDomain"
+  - entity_type: "Host"
+    field_mappings:
+      - identifier: "HostName"
+        column:     "DeviceName"
+  - entity_type: "Process"
+    field_mappings:
+      - identifier: "ProcessId"
+        column:     "InitiatingProcessFileName"
+
+# ── CUSTOM DETAILS ────────────────────────────────────────────────────────────
+custom_details:
+  "Loading Process":  "InitiatingProcessFileName"
+  "Process Folder":   "InitiatingProcessFolderPath"
+  "Command Line":     "InitiatingProcessCommandLine"
+  "Parent Process":   "InitiatingProcessParentFileName"
+
+# ── EVENT GROUPING ────────────────────────────────────────────────────────────
+event_grouping: "AlertPerResult"
+
+# ── FALSE POSITIVE GUIDANCE ───────────────────────────────────────────────────
+false_positive_guidance: |
+  Expected FP rate is low. samlib.dll is not commonly loaded outside of the
+  authentication subsystem processes.
+
+  Common FP scenarios:
+  - Legitimate credential management tools that interface with local accounts
+    (password managers, identity management agents, domain join tooling)
+  - Third-party authentication software — verify against your software inventory
+  - Some enterprise security products that hook authentication APIs
+
+  If a recurring FP source is identified, add the process name to the
+  ApprovedSamlibProcesses dynamic list in the query. Document the addition
+  with the product name and business justification.
+
+  Note: SamiChangePasswordUser is an undocumented API. Any consumer of this
+  function outside of the Windows authentication subsystem warrants investigation.
+
+# ── RESPONSE GUIDANCE ─────────────────────────────────────────────────────────
+response_guidance: |
+  1. Identify the loading process from alert custom details.
+  2. Is InitiatingProcessFolderPath in a standard install location or
+     a user-writable location (AppData, Temp, Downloads)? User-writable = escalate.
+  3. Pull the process timeline on the affected host in the 30-minute window:
+     DeviceProcessEvents | where DeviceName == "<host>"
+     | where Timestamp > ago(30m) | order by Timestamp asc
+  4. Check the same window for:
+     - Event IDs 4723/4724 (password change on local admin account)
+     - Event ID 4624 LogonType 2 (interactive logon)
+     - win_security_vss_registry_hive_shadow_copy_access alerts
+  5. The full BlueHammer sequence is: samlib.dll load -> 4723 (password change) ->
+     4624 (logon) -> 4723 (password restore). If all three are present within
+     30 seconds for the same TargetUserName, treat as confirmed exploitation.
+  6. Isolate host via MDE and escalate to Tier 2 / IR.
+
+# ── THREAT SCENARIO ───────────────────────────────────────────────────────────
+threat_scenario:
+  applicable: true
+  attack_chain: "VSS Recon (T1082) -> RstrtMgr Oplock (T1068) -> Cloud Files Defender Freeze (T1562.001) -> RPC+Junction SAM Redirect (T1574.005) -> SAM+Boot Key Extraction (T1003.002/T1552.002) -> samlib+SamiChangePasswordUser (T1098) -> Admin Auth+Token Duplication (T1134.001) -> GUID Service SYSTEM Shell (T1543.003/T1569.002)"
+  preceding_technique:
+    mitre_id:     "T1552.002"
+    description:  "LSA boot key extracted and NTLM hashes decrypted from SAM hive."
+    detection_id: "win_security_lsa_bootkey_registry_access_non_lsass"
+  following_technique:
+    mitre_id:     "T1098"
+    description:  "SamiChangePasswordUser called to reset local admin password using recovered NTLM hash."
+    detection_id: "win_security_local_admin_password_rapid_change_restore"
+  coverage_assessment: "Covers Step 6 of 8 in the BlueHammer chain. Fires immediately before Event IDs 4723/4724 — provides a pre-event indicator for the password manipulation that follows."
+
+# ── TESTING EVIDENCE ──────────────────────────────────────────────────────────
+testing:
+  unit_test:
+    status:        "PENDING"
+    evidence_path: "docs/test-evidence/win_security_samlib_load_non_lsass_process/unit-test.md"
+    notes:         "Write a test binary that loads samlib.dll without calling any exports. Execute from a standard user context in isolated environment. Confirm DeviceImageLoadEvents record and alert fires."
+  back_test:
+    status:        "PENDING"
+    period_days:   7
+    tp_count:      0
+    fp_count:      0
+    fp_rate_pct:   0.0
+    estimated_daily_volume: 0
+    evidence_path: "docs/test-evidence/win_security_samlib_load_non_lsass_process/back-test.md"
+    notes:         "Run against 7 days of DeviceImageLoadEvents before production deployment. Populate ApprovedSamlibProcesses with any legitimate loaders identified."
+  adversary_simulation:
+    status:        "PENDING"
+    caldera_ability_id: "N/A — requires BlueHammer emulation with --force flag"
+    atomic_test_ref:    "N/A"
+    evidence_path: "docs/test-evidence/win_security_samlib_load_non_lsass_process/simulation-log.md"
+    notes:         "Execute BlueHammer with --force flag in CAAT environment (technoherder/BlueHammerFix). Stages 6-7 must be reached to trigger samlib.dll load. Confirm DeviceImageLoadEvents fires and alert surfaces."
+
+# ── DESIGN DOCUMENT ───────────────────────────────────────────────────────────
+design_document_path: "docs/design/win_security_samlib_load_non_lsass_process-design.md"
+
+# ── CHANGE HISTORY ────────────────────────────────────────────────────────────
+change_history:
+  - date:      "2026-04-08"
+    author:    "Detection Engineering"
+    pr_number: "FILL"
+    change:    "Initial commit. KQL adaptation of technoherder/BlueHammerFix bluehammer_samlib_load.yml Sigma rule. Credit: https://github.com/technoherder/BlueHammerFix"
